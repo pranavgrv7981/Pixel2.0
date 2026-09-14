@@ -39,7 +39,7 @@ async def run_repl(runtime: PixelRuntime) -> None:
         if not text:
             continue
         if text.lower() in ("quit", "exit", "bye"):
-            print("\nPixel: Goodbye! 👋")
+            print("\nPixel: Goodbye!")
             break
 
         response = await runtime.handle_input(text)
