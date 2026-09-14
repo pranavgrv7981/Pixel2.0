@@ -6,8 +6,14 @@ from typing import AsyncIterator
 from app.ai.provider import AIProvider, ChatMessage, ChatResponse, ProviderCapabilities
 
 
+from app.core.config import FallbackProviderConfig
+
+
 class FallbackProvider(AIProvider):
     """Fallback AI provider."""
+
+    def __init__(self, config: FallbackProviderConfig | None = None) -> None:
+        self.config = config or FallbackProviderConfig()
 
     @property
     def name(self) -> str:
@@ -31,7 +37,7 @@ class FallbackProvider(AIProvider):
             await asyncio.sleep(0.01)
 
     async def is_available(self) -> bool:
-        return True
+        return bool(self.config.enabled)
 
     def capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(

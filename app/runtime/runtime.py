@@ -2,6 +2,7 @@
 
 Owns the lifecycle of all subsystems. Delegates all business logic
 to specialized components. Does not contain feature implementation itself.
+AI models are replaceable intelligence providers behind a provider abstraction.
 """
 
 from __future__ import annotations
@@ -11,14 +12,14 @@ import uuid
 from typing import Any
 
 from app.core.config import PixelConfig
-from app.core.errors import PixelError
+from app.core.errors import PixelError, ProviderError, ActionError, SecurityError
 from app.core.logging import (
     bind_request_context,
     clear_request_context,
     get_logger,
     setup_logging,
 )
-from app.core.types import PixelStateEnum, Route
+from app.core.types import PixelStateEnum
 
 from app.events.bus import EventBus
 from app.events.types import (
@@ -31,10 +32,9 @@ from app.events.types import (
 
 from app.runtime.state import PixelStateMachine
 
-from app.ai.providers.fallback import FallbackProvider
-from app.ai.registry import ProviderRegistry
-from app.ai.router import ModelRouter
 from app.ai.provider import ChatMessage
+from app.ai.registry import ProviderRegistry, create_provider_registry
+from app.ai.router import ModelRouter
 
 from app.intents.direct import DirectIntentEngine
 from app.intents.router import IntentRouter
@@ -42,6 +42,7 @@ from app.intents.router import IntentRouter
 from app.actions.engine import ActionEngine
 from app.actions.registry import ActionRegistry
 from app.actions.types import ActionRequest
+from app.actions.builtin import register_builtin_actions
 
 from app.security.permissions import SecurityLayer
 
@@ -54,19 +55,24 @@ class PixelRuntime:
     Coordinates all subsystems:
     - EventBus: decoupled inter-subsystem communication
     - StateMachine: explicit runtime state
-    - ProviderRegistry: AI provider management
+    - ProviderRegistry: AI provider management and deterministic selection
     - ModelRouter: request routing
     - IntentRouter: deterministic + AI intent detection
-    - ActionEngine: safe action execution
+    - ActionEngine: safe action execution with permission verification
     - SecurityLayer: centralized permission checks
     """
 
-    def __init__(self, config: PixelConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: PixelConfig | None = None,
+        provider_registry: ProviderRegistry | None = None,
+    ) -> None:
         self._config = config or PixelConfig()
+        self._custom_provider_registry = provider_registry
         self._running = False
         self._session_id = ""
 
-        # -- Subsystems (created on start) --
+        # -- Subsystems (initialized on start) --
         self.event_bus: EventBus | None = None
         self.state_machine: PixelStateMachine | None = None
         self.provider_registry: ProviderRegistry | None = None
@@ -99,7 +105,10 @@ class PixelRuntime:
     # -- Lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
-        """Initialize all subsystems and enter IDLE state."""
+        """Initialize all subsystems and enter IDLE state.
+
+        Safe against repeated calls and cleans up on partial initialization failure.
+        """
         if self._running:
             logger.warning("runtime_already_running")
             return
@@ -118,62 +127,81 @@ class PixelRuntime:
             session_id=self._session_id,
         )
 
-        # Initialize subsystems in dependency order
-        self.event_bus = EventBus()
-        self.state_machine = PixelStateMachine(event_bus=self.event_bus)
-        self.security = SecurityLayer(self._config.security)
-        self.action_registry = ActionRegistry()
-        self.action_engine = ActionEngine(
-            registry=self.action_registry,
-            security=self.security,
-        )
+        try:
+            # 1. Event bus and state machine
+            self.event_bus = EventBus()
+            self.state_machine = PixelStateMachine(event_bus=self.event_bus)
 
-        # AI providers
-        self.provider_registry = ProviderRegistry()
-        self.provider_registry.register(FallbackProvider())
+            # 2. Security and actions
+            self.security = SecurityLayer(self._config.security)
+            self.action_registry = ActionRegistry()
+            register_builtin_actions(self.action_registry)
+            self.action_engine = ActionEngine(
+                registry=self.action_registry,
+                security=self.security,
+                event_bus=self.event_bus,
+            )
 
-        # Router
-        self.model_router = ModelRouter(
-            registry=self.provider_registry,
-            config=self._config.router,
-        )
+            # 3. AI provider layer (decoupled from concrete provider classes)
+            if self._custom_provider_registry is not None:
+                self.provider_registry = self._custom_provider_registry
+            else:
+                self.provider_registry = create_provider_registry(self._config.ai)
 
-        # Intent detection
-        direct_engine = DirectIntentEngine(self._config.intent)
-        self.intent_router = IntentRouter(
-            direct_engine=direct_engine,
-            model_router=self.model_router,
-        )
+            # 4. Model and intent routers
+            self.model_router = ModelRouter(
+                registry=self.provider_registry,
+                config=self._config.router,
+            )
+            direct_engine = DirectIntentEngine(self._config.intent)
+            self.intent_router = IntentRouter(
+                direct_engine=direct_engine,
+                model_router=self.model_router,
+            )
 
-        self._running = True
+            self._running = True
+            await self.event_bus.emit(PixelActivated(source="runtime"))
 
-        # Emit activation event
-        await self.event_bus.emit(PixelActivated(source="runtime"))
-
-        logger.info(
-            "runtime_started",
-            state=self.state.value,
-            providers=self.provider_registry.list_all(),
-        )
+            logger.info(
+                "runtime_started",
+                state=self.state.value,
+                providers=self.provider_registry.list_all(),
+            )
+        except Exception as exc:
+            logger.error("runtime_start_failed", error=str(exc))
+            await self._teardown_subsystems()
+            raise
 
     async def stop(self) -> None:
-        """Gracefully shut down all subsystems."""
+        """Gracefully shut down all subsystems. Safe against repeated calls."""
         if not self._running:
             return
 
         logger.info("runtime_stopping", session_id=self._session_id)
+        await self._teardown_subsystems()
+        logger.info("runtime_stopped")
 
-        # Reset state
+    async def _teardown_subsystems(self) -> None:
+        """Internal helper to clean up subsystems safely."""
         if self.state_machine:
             self.state_machine.reset()
 
-        # Emit deactivation
         if self.event_bus:
-            await self.event_bus.emit(PixelDeactivated(source="runtime"))
+            try:
+                await self.event_bus.emit(PixelDeactivated(source="runtime"))
+            except Exception:
+                pass
             self.event_bus.clear()
 
+        self.event_bus = None
+        self.state_machine = None
+        self.provider_registry = None
+        self.model_router = None
+        self.intent_router = None
+        self.action_engine = None
+        self.action_registry = None
+        self.security = None
         self._running = False
-        logger.info("runtime_stopped")
 
     # -- Input handling ------------------------------------------------------
 
@@ -183,7 +211,13 @@ class PixelRuntime:
         Returns:
             Response string for the user.
         """
-        if not self._running:
+        # Guard against uninitialized or partially initialized runtime
+        if (
+            not self._running
+            or self.state_machine is None
+            or self.intent_router is None
+            or self.event_bus is None
+        ):
             return "Pixel is not running."
 
         request_id = str(uuid.uuid4())[:12]
@@ -192,7 +226,7 @@ class PixelRuntime:
 
         try:
             # Emit input event
-            await self.event_bus.emit(  # type: ignore[union-attr]
+            await self.event_bus.emit(
                 UserMessageReceived(
                     source="user",
                     text=text,
@@ -201,13 +235,13 @@ class PixelRuntime:
             )
 
             # Transition to UNDERSTANDING
-            self.state_machine.transition(PixelStateEnum.UNDERSTANDING)  # type: ignore[union-attr]
+            self.state_machine.transition(PixelStateEnum.UNDERSTANDING)
 
             # Route through intent system
-            result = await self.intent_router.route(text)  # type: ignore[union-attr]
+            result = await self.intent_router.route(text)
 
             # Emit intent detection event
-            await self.event_bus.emit(  # type: ignore[union-attr]
+            await self.event_bus.emit(
                 IntentDetected(
                     source="intent_router",
                     intent=result.intent or "unknown",
@@ -216,11 +250,11 @@ class PixelRuntime:
                 )
             )
 
-            # --- Direct intent with response ---
+            # --- Case 1: Direct intent with pre-computed response ---
             if result.direct and result.response is not None:
-                self.state_machine.transition(PixelStateEnum.EXECUTING)  # type: ignore[union-attr]
-                self.state_machine.transition(PixelStateEnum.SUCCESS)  # type: ignore[union-attr]
-                self.state_machine.transition(PixelStateEnum.IDLE)  # type: ignore[union-attr]
+                self.state_machine.transition(PixelStateEnum.EXECUTING)
+                self.state_machine.transition(PixelStateEnum.SUCCESS)
+                self.state_machine.transition(PixelStateEnum.IDLE)
 
                 elapsed = (time.perf_counter() - start_time) * 1000
                 logger.info(
@@ -231,25 +265,23 @@ class PixelRuntime:
                 )
                 return result.response
 
-            # --- Direct intent needing action ---
+            # --- Case 2: Direct intent requiring action execution ---
             if result.direct and result.intent:
-                self.state_machine.transition(PixelStateEnum.EXECUTING)  # type: ignore[union-attr]
+                self.state_machine.transition(PixelStateEnum.EXECUTING)
                 response = await self._execute_intent_action(result.intent, result.parameters)
                 if response:
-                    self.state_machine.transition(PixelStateEnum.SUCCESS)  # type: ignore[union-attr]
+                    self.state_machine.transition(PixelStateEnum.SUCCESS)
                 else:
                     response = f"I recognized the command '{result.intent}' but the action handler is not yet implemented."
-                    self.state_machine.transition(PixelStateEnum.SUCCESS)  # type: ignore[union-attr]
-                self.state_machine.transition(PixelStateEnum.IDLE)  # type: ignore[union-attr]
+                    self.state_machine.transition(PixelStateEnum.SUCCESS)
+                self.state_machine.transition(PixelStateEnum.IDLE)
                 return response
 
-            # --- AI routing ---
-            self.state_machine.transition(PixelStateEnum.THINKING)  # type: ignore[union-attr]
-
+            # --- Case 3: AI routing with automatic fallback ---
+            self.state_machine.transition(PixelStateEnum.THINKING)
             response = await self._handle_ai_request(text, request_id)
-
-            self.state_machine.transition(PixelStateEnum.RESPONDING)  # type: ignore[union-attr]
-            self.state_machine.transition(PixelStateEnum.IDLE)  # type: ignore[union-attr]
+            self.state_machine.transition(PixelStateEnum.RESPONDING)
+            self.state_machine.transition(PixelStateEnum.IDLE)
 
             elapsed = (time.perf_counter() - start_time) * 1000
             logger.info(
@@ -267,52 +299,74 @@ class PixelRuntime:
                 error=str(exc),
                 error_type=type(exc).__name__,
             )
-            # Try to recover state
-            try:
-                if self.state_machine and self.state_machine.state != PixelStateEnum.IDLE:
+            # Transition through ERROR state back to IDLE
+            if self.state_machine:
+                try:
+                    self.state_machine.transition(PixelStateEnum.ERROR)
+                except Exception:
                     self.state_machine.reset()
-            except Exception:
-                pass
+                else:
+                    try:
+                        self.state_machine.transition(PixelStateEnum.IDLE)
+                    except Exception:
+                        self.state_machine.reset()
 
             return self._format_error(exc)
 
         finally:
             clear_request_context()
 
-    # -- Internal ------------------------------------------------------------
+    # -- Internal AI & Action Handling ---------------------------------------
 
     async def _handle_ai_request(self, text: str, request_id: str) -> str:
-        """Send text to an AI provider via the router."""
+        """Send text to an AI provider with explicit fallback across candidate providers."""
         if not self.provider_registry:
             return "No AI providers available."
 
-        # Get best available provider
-        provider = await self.provider_registry.get_best()
-        if provider is None:
+        candidates = await self.provider_registry.select_candidate_chain()
+        if not candidates:
+            logger.error("no_ai_providers_available", request_id=request_id)
             return "No AI providers are currently available."
 
-        try:
-            messages = [ChatMessage(role="user", content=text)]
-            response = await provider.chat(messages)
+        messages = [ChatMessage(role="user", content=text)]
+        last_error: Exception | None = None
 
-            await self.event_bus.emit(  # type: ignore[union-attr]
-                AIResponseCompleted(
-                    source="ai",
+        for idx, provider in enumerate(candidates):
+            try:
+                logger.info(
+                    "ai_provider_attempt",
                     provider=provider.name,
-                    model=response.model,
-                    response=response.content,
-                    latency_ms=response.latency_ms,
+                    candidate_index=idx,
+                    request_id=request_id,
                 )
-            )
-            return response.content
+                response = await provider.chat(messages)
 
-        except PixelError as exc:
-            logger.warning(
-                "ai_provider_failed",
-                provider=provider.name,
-                error=str(exc),
-            )
-            return f"I'm having trouble connecting to my AI backend. {self._format_error(exc)}"
+                await self.event_bus.emit(  # type: ignore[union-attr]
+                    AIResponseCompleted(
+                        source="ai",
+                        provider=provider.name,
+                        model=response.model,
+                        response=response.content,
+                        latency_ms=response.latency_ms,
+                    )
+                )
+                return response.content
+
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "ai_provider_failed",
+                    provider=provider.name,
+                    candidate_index=idx,
+                    error=str(exc),
+                    has_fallback=(idx < len(candidates) - 1),
+                    request_id=request_id,
+                )
+                # Continue loop to next candidate in chain
+
+        # If all candidates failed
+        logger.error("all_ai_providers_failed", request_id=request_id, candidates_tried=len(candidates))
+        return f"I'm having trouble connecting to my AI backend. {self._format_error(last_error or ProviderError('AI provider error'))}"
 
     async def _execute_intent_action(
         self, intent: str, parameters: dict[str, Any]
@@ -333,11 +387,8 @@ class PixelRuntime:
         return None
 
     def _format_error(self, exc: Exception) -> str:
-        """Format an error for user display (no technical details)."""
+        """Format an error for user display (no raw technical details)."""
         if isinstance(exc, PixelError):
-            # User-friendly messages based on error type
-            from app.core.errors import ProviderError, ActionError, SecurityError
-
             if isinstance(exc, ProviderError):
                 return "I'm having trouble with my AI connection right now. Try a simpler request, or try again in a moment."
             if isinstance(exc, SecurityError):
@@ -347,7 +398,7 @@ class PixelRuntime:
             return "Something went wrong. Please try again."
         return "An unexpected error occurred. Please try again."
 
-    # -- Dispatch/Event shortcuts -------------------------------------------
+    # -- Dispatch / Event shortcuts ------------------------------------------
 
     async def dispatch_event(self, event: Any) -> None:
         """Dispatch an event on the event bus."""

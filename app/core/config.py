@@ -56,6 +56,7 @@ class ProvidersConfig(BaseModel):
 
 class AIConfig(BaseModel):
     default_provider: str = "fallback"
+    provider_priority: list[str] = Field(default_factory=lambda: ["cloud", "ollama", "fallback"])
     request_timeout_seconds: int = 30
     max_retries: int = 2
     providers: ProvidersConfig = ProvidersConfig()

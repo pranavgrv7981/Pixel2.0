@@ -31,15 +31,18 @@ _VALID_TRANSITIONS: dict[PixelStateEnum, set[PixelStateEnum]] = {
     PixelStateEnum.AWAKENING: {
         PixelStateEnum.LISTENING,
         PixelStateEnum.IDLE,
+        PixelStateEnum.ERROR,
     },
     PixelStateEnum.LISTENING: {
         PixelStateEnum.UNDERSTANDING,
         PixelStateEnum.IDLE,
+        PixelStateEnum.ERROR,
     },
     PixelStateEnum.UNDERSTANDING: {
         PixelStateEnum.THINKING,
         PixelStateEnum.EXECUTING,
         PixelStateEnum.IDLE,
+        PixelStateEnum.ERROR,
     },
     PixelStateEnum.THINKING: {
         PixelStateEnum.RESPONDING,
@@ -48,6 +51,7 @@ _VALID_TRANSITIONS: dict[PixelStateEnum, set[PixelStateEnum]] = {
     PixelStateEnum.RESPONDING: {
         PixelStateEnum.EXECUTING,
         PixelStateEnum.IDLE,
+        PixelStateEnum.ERROR,
     },
     PixelStateEnum.EXECUTING: {
         PixelStateEnum.SUCCESS,

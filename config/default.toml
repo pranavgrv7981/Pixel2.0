@@ -12,6 +12,7 @@ file = ""           # empty = stdout only
 
 [ai]
 default_provider = "fallback"
+provider_priority = ["cloud", "ollama", "fallback"]
 request_timeout_seconds = 30
 max_retries = 2
 

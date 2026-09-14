@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 from app.core.types import Route
-from app.core.errors import ActionError
+from app.core.errors import PixelError
 
 
 class RequestProfile(BaseModel, frozen=True):
@@ -57,4 +57,4 @@ def profile_for_route(route: Route) -> RequestProfile:
         return HEAVY_PROFILE
     elif route == Route.DIRECT:
         return FAST_PROFILE
-    raise ActionError(f"No profile defined for route {route}")
+    raise PixelError(f"No profile defined for route {route}")

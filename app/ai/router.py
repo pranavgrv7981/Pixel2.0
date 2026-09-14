@@ -33,13 +33,9 @@ class ModelRouter:
         """Determine the route and provider for a given input."""
         length = len(text)
         
-        # Default fallback
-        provider_name = "fallback"
-        available = await self.registry.get_available()
-        if available:
-            provider_name = available[0].name
-        
-        model_name = "default_model"
+        selected = await self.registry.select_provider()
+        provider_name = selected.name if selected else self.registry.default_provider
+        model_name = getattr(selected, "default_model", "") or f"{provider_name}-default"
 
         heavy_keywords = ["analyze", "explain in detail", "plan", "refactor", "codebase"]
         greeting_prefixes = ("hi ", "hi!", "hello", "hey ", "hey!", "good morning", "good afternoon", "good evening")
