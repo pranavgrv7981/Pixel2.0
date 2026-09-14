@@ -18,9 +18,10 @@ max_retries = 2
 
 [ai.providers.cloud]
 enabled = false
-provider = "gemini"
-api_key_env = "GEMINI_API_KEY"
-model = "gemini-2.5-flash"
+provider = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openrouter/free"
 timeout_seconds = 30
 max_retries = 2
 

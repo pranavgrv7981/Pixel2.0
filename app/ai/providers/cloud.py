@@ -1,9 +1,9 @@
-"""Cloud AI provider implementation using Google Gemini SDK (google-genai).
+"""Cloud AI provider implementation using OpenRouter HTTP API.
 
-Implements the AIProvider interface for Google Gemini models with:
-- Async chat generation and streaming
+Implements the AIProvider interface for OpenRouter with:
+- Direct, lightweight HTTP integration via httpx
+- Async chat generation and SSE streaming
 - Multi-turn conversation conversion
-- System instruction support
 - Bounded transient retries and explicit timeouts
 - Non-expensive availability checks
 - Token and latency telemetry
@@ -13,9 +13,11 @@ Implements the AIProvider interface for Google Gemini models with:
 from __future__ import annotations
 
 import asyncio
-import inspect
+import json
 import time
 from typing import Any, AsyncIterator
+
+import httpx
 
 from app.ai.provider import AIProvider, ChatMessage, ChatResponse, ProviderCapabilities
 from app.core.config import CloudProviderConfig
@@ -26,15 +28,15 @@ logger = get_logger("pixel.ai.cloud")
 
 
 class CloudProvider(AIProvider):
-    """Google Gemini cloud AI provider."""
+    """OpenRouter Cloud AI provider."""
 
     def __init__(
         self,
         config: CloudProviderConfig | None = None,
-        client: Any = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.config = config or CloudProviderConfig()
-        self._client = client
+        self._http_client = http_client
         self._auth_failed: bool = False
 
     @property
@@ -42,15 +44,18 @@ class CloudProvider(AIProvider):
         return "cloud"
 
     def capabilities(self) -> ProviderCapabilities:
-        """Declared capabilities of the Gemini cloud provider."""
+        """Declared capabilities of the OpenRouter provider.
+
+        Conservative for Phase 1: conversation and streaming.
+        """
         return ProviderCapabilities(
             conversation=True,
-            tool_calling=True,
-            reasoning=True,
-            vision=True,
-            structured_output=True,
+            tool_calling=False,
+            reasoning=False,
+            vision=False,
+            structured_output=False,
             streaming=True,
-            context_capacity=1048576,
+            context_capacity=128000,
         )
 
     # -- Availability --------------------------------------------------------
@@ -58,7 +63,7 @@ class CloudProvider(AIProvider):
     async def is_available(self) -> bool:
         """Fast, non-expensive availability check.
 
-        Does not perform live generation requests during health check.
+        Does not perform network requests on application startup.
         """
         if not self.config.enabled:
             return False
@@ -67,131 +72,112 @@ class CloudProvider(AIProvider):
         api_key = self.config.get_api_key()
         return bool(api_key and api_key.strip())
 
-    # -- Client Management ---------------------------------------------------
+    # -- HTTP Client & Headers -----------------------------------------------
 
-    def _get_client(self) -> Any:
-        """Lazily initialize and return the google-genai Client."""
-        if self._client is not None:
-            return self._client
-
+    def _get_headers(self) -> dict[str, str]:
+        """Construct request headers with authorization."""
         api_key = self.config.get_api_key()
         if not api_key:
             self._auth_failed = True
             raise ProviderError(
-                "Cloud provider API key is not configured",
+                "Cloud provider API key is missing or not configured",
                 provider=self.name,
                 model=self.config.get_model(),
                 stage="auth",
                 context={"error_type": "MissingCredentials", "env_var": self.config.api_key_env},
             )
 
-        try:
-            from google import genai
-            self._client = genai.Client(api_key=api_key)
-            return self._client
-        except Exception as exc:
-            logger.error("cloud_client_init_failed", error=str(exc))
-            raise ProviderError(
-                "Failed to initialize cloud AI client",
-                provider=self.name,
-                model=self.config.get_model(),
-                stage="init",
-                context={"error_type": type(exc).__name__},
-            ) from exc
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.config.http_referer:
+            headers["HTTP-Referer"] = self.config.http_referer
+        if self.config.x_title:
+            headers["X-Title"] = self.config.x_title
+
+        return headers
+
+    def _get_endpoint_url(self) -> str:
+        """Get the full completions endpoint URL."""
+        base = (self.config.base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        return f"{base}/chat/completions"
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return injected client or new AsyncClient."""
+        if self._http_client is not None:
+            return self._http_client
+        return httpx.AsyncClient(timeout=httpx.Timeout(self.config.timeout_seconds))
 
     # -- Message Conversion --------------------------------------------------
 
-    def _convert_messages(
-        self, messages: list[ChatMessage]
-    ) -> tuple[str | None, list[Any]]:
-        """Convert Pixel ChatMessage sequence into Gemini system instruction and contents.
-
-        Returns:
-            (system_instruction, contents_list)
-        """
-        from google.genai import types
-
-        system_parts: list[str] = []
-        contents: list[types.Content] = []
+    def _convert_messages(self, messages: list[ChatMessage]) -> list[dict[str, str]]:
+        """Convert Pixel ChatMessage sequence into OpenAI-compatible message dictionaries."""
+        payload_messages: list[dict[str, str]] = []
 
         for msg in messages:
             role = (msg.role or "user").lower().strip()
-            content_text = msg.content or ""
+            content = msg.content or ""
 
-            if role in ("system", "developer"):
-                if content_text.strip():
-                    system_parts.append(content_text.strip())
-            elif role in ("assistant", "model", "bot"):
-                contents.append(
-                    types.Content(
-                        role="model",
-                        parts=[types.Part.from_text(text=content_text)],
-                    )
-                )
+            if role in ("assistant", "model", "bot"):
+                target_role = "assistant"
+            elif role in ("system", "developer"):
+                target_role = "system"
             else:
-                # user / human / default
-                contents.append(
-                    types.Content(
-                        role="user",
-                        parts=[types.Part.from_text(text=content_text)],
-                    )
-                )
+                target_role = "user"
 
-        system_instruction = "\n\n".join(system_parts) if system_parts else None
+            payload_messages.append({"role": target_role, "content": content})
 
-        # Gemini requires at least one user content item if contents list is empty
-        if not contents:
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=" ")],
-                )
-            )
+        if not payload_messages:
+            payload_messages.append({"role": "user", "content": " "})
 
-        return system_instruction, contents
+        return payload_messages
 
     # -- Error Classification & Safety ---------------------------------------
 
     def _is_transient_error(self, exc: Exception) -> bool:
-        """Classify whether an exception is a transient error eligible for retry."""
-        status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        """Determine if an error is transient and eligible for retry."""
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = exc.response.status_code
+            if code in (400, 401, 403, 404):
+                return False
+            if code in (429, 500, 502, 503, 504):
+                return True
 
-        # Permanent status codes — NEVER retry
+        if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+            return True
+
+        status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
         if status_code in (400, 401, 403, 404):
             return False
-
-        # Transient status codes
         if status_code in (429, 500, 502, 503, 504):
-            return True
-
-        exc_str = str(exc).lower()
-        if any(term in exc_str for term in ["rate limit", "resource_exhausted", "unavailable", "deadline", "timeout"]):
-            return True
-
-        error_type = type(exc).__name__.lower()
-        if any(term in error_type for term in ["timeout", "connect", "network", "servererror"]):
             return True
 
         return False
 
     def _sanitize_error(self, exc: Exception, model: str, stage: str) -> ProviderError:
-        """Create a safe ProviderError with structured diagnostics without leaking credentials."""
+        """Create a safe ProviderError without leaking credentials."""
         api_key = self.config.get_api_key()
         raw_msg = str(exc)
         if api_key and api_key in raw_msg:
             raw_msg = raw_msg.replace(api_key, "[REDACTED_API_KEY]")
 
-        status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        status_code = None
+        if isinstance(exc, httpx.HTTPStatusError):
+            status_code = exc.response.status_code
+        else:
+            status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+
         error_type = type(exc).__name__
 
-        if status_code in (401, 403) or "unauthenticated" in raw_msg.lower():
+        if status_code in (401, 403) or "unauthenticated" in raw_msg.lower() or "unauthorized" in raw_msg.lower():
             self._auth_failed = True
             stage = "auth"
             safe_msg = f"Cloud AI authentication failed: {raw_msg}"
-        elif status_code == 429 or "resource_exhausted" in raw_msg.lower():
+        elif status_code == 429 or "rate limit" in raw_msg.lower():
             stage = "rate_limit"
             safe_msg = f"Cloud AI rate limit or quota exceeded: {raw_msg}"
-        elif isinstance(exc, asyncio.TimeoutError):
+        elif isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
             stage = "timeout"
             safe_msg = f"Cloud AI request timed out after {self.config.timeout_seconds}s."
         else:
@@ -213,145 +199,164 @@ class CloudProvider(AIProvider):
 
     async def chat(self, messages: list[ChatMessage], **kwargs: Any) -> ChatResponse:
         """Execute a non-streaming chat request with timeout and transient retries."""
-        from google.genai import types
-
         model = kwargs.get("model") or self.config.get_model()
-        client = self._get_client()
-        system_instruction, contents = self._convert_messages(messages)
+        url = self._get_endpoint_url()
+        headers = self._get_headers()
+        payload_messages = self._convert_messages(messages)
 
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=kwargs.get("temperature", 0.7),
-        )
-        if "max_output_tokens" in kwargs:
-            config.max_output_tokens = kwargs["max_output_tokens"]
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": payload_messages,
+            "stream": False,
+        }
+        if "temperature" in kwargs:
+            payload["temperature"] = kwargs["temperature"]
+        if "max_tokens" in kwargs:
+            payload["max_tokens"] = kwargs["max_tokens"]
 
         max_retries = self.config.max_retries
-        timeout_seconds = self.config.timeout_seconds
+        timeout = httpx.Timeout(self.config.timeout_seconds)
         start_time = time.perf_counter()
 
-        for attempt in range(max_retries + 1):
-            try:
-                # Wrap API call with explicit timeout
-                response = await asyncio.wait_for(
-                    client.aio.models.generate_content(
-                        model=model,
-                        contents=contents,
-                        config=config,
-                    ),
-                    timeout=timeout_seconds,
-                )
+        client = self._get_client()
+        should_close_client = self._http_client is None
 
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
+        try:
+            for attempt in range(max_retries + 1):
+                try:
+                    response = await client.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
 
-                # Extract content
-                content_text = getattr(response, "text", None) or ""
+                    data = response.json()
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000
 
-                # Extract token usage telemetry safely
-                input_tokens = 0
-                output_tokens = 0
-                usage = getattr(response, "usage_metadata", None)
-                if usage is not None:
-                    input_tokens = getattr(usage, "prompt_token_count", 0) or 0
-                    output_tokens = (
-                        getattr(usage, "response_token_count", 0)
-                        or getattr(usage, "candidates_token_count", 0)
-                        or 0
+                    # Extract content
+                    choices = data.get("choices", [])
+                    content = choices[0].get("message", {}).get("content", "") if choices else ""
+
+                    # Extract token telemetry
+                    usage = data.get("usage", {})
+                    input_tokens = usage.get("prompt_tokens", 0) or 0
+                    output_tokens = usage.get("completion_tokens", 0) or 0
+
+                    finish_reason = "stop"
+                    if choices:
+                        raw_reason = choices[0].get("finish_reason")
+                        if raw_reason is not None:
+                            finish_reason = str(raw_reason).lower()
+
+                    resolved_model = data.get("model", model)
+
+                    logger.info(
+                        "cloud_ai_completed",
+                        provider=self.name,
+                        model=resolved_model,
+                        duration_ms=round(elapsed_ms, 2),
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        finish_reason=finish_reason,
+                        attempts=attempt + 1,
                     )
 
-                # Extract finish reason
-                finish_reason = "stop"
-                candidates = getattr(response, "candidates", None)
-                if candidates and len(candidates) > 0:
-                    cand = candidates[0]
-                    raw_reason = getattr(cand, "finish_reason", None)
-                    if raw_reason is not None:
-                        finish_reason = str(raw_reason).lower()
+                    return ChatResponse(
+                        content=content,
+                        model=resolved_model,
+                        provider=self.name,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        latency_ms=elapsed_ms,
+                        finish_reason=finish_reason,
+                    )
 
-                logger.info(
-                    "cloud_ai_completed",
-                    provider=self.name,
-                    model=model,
-                    duration_ms=round(elapsed_ms, 2),
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    finish_reason=finish_reason,
-                    attempts=attempt + 1,
-                )
+                except Exception as exc:
+                    is_transient = self._is_transient_error(exc)
+                    has_retry = is_transient and (attempt < max_retries)
 
-                return ChatResponse(
-                    content=content_text,
-                    model=model,
-                    provider=self.name,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    latency_ms=elapsed_ms,
-                    finish_reason=finish_reason,
-                )
+                    logger.warning(
+                        "cloud_ai_attempt_failed",
+                        provider=self.name,
+                        model=model,
+                        attempt=attempt + 1,
+                        max_retries=max_retries,
+                        error=str(exc),
+                        will_retry=has_retry,
+                    )
 
-            except Exception as exc:
-                is_transient = self._is_transient_error(exc)
-                has_retry = is_transient and (attempt < max_retries)
+                    if has_retry:
+                        delay = min(0.25 * (2 ** attempt), 2.0)
+                        await asyncio.sleep(delay)
+                        continue
 
-                logger.warning(
-                    "cloud_ai_attempt_failed",
-                    provider=self.name,
-                    model=model,
-                    attempt=attempt + 1,
-                    max_retries=max_retries,
-                    error=str(exc),
-                    will_retry=has_retry,
-                )
+                    raise self._sanitize_error(exc, model=model, stage="chat") from exc
 
-                if has_retry:
-                    # Bounded exponential backoff
-                    delay = min(0.25 * (2 ** attempt), 2.0)
-                    await asyncio.sleep(delay)
-                    continue
-
-                # Not retryable or retries exhausted
-                raise self._sanitize_error(exc, model=model, stage="chat") from exc
-
-        # Safeguard fallback
-        raise ProviderError("Maximum retries exhausted", provider=self.name, model=model, stage="chat")
+            raise ProviderError("Maximum retries exhausted", provider=self.name, model=model, stage="chat")
+        finally:
+            if should_close_client:
+                await client.aclose()
 
     # -- Streaming Chat ------------------------------------------------------
 
     async def stream_chat(
         self, messages: list[ChatMessage], **kwargs: Any
     ) -> AsyncIterator[str]:
-        """Stream incremental text response chunks from Gemini."""
-        from google.genai import types
-
+        """Stream incremental text response chunks from OpenRouter SSE."""
         model = kwargs.get("model") or self.config.get_model()
+        url = self._get_endpoint_url()
+        headers = self._get_headers()
+        payload_messages = self._convert_messages(messages)
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": payload_messages,
+            "stream": True,
+        }
+        if "temperature" in kwargs:
+            payload["temperature"] = kwargs["temperature"]
+        if "max_tokens" in kwargs:
+            payload["max_tokens"] = kwargs["max_tokens"]
+
+        timeout = httpx.Timeout(self.config.timeout_seconds)
         client = self._get_client()
-        system_instruction, contents = self._convert_messages(messages)
-
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=kwargs.get("temperature", 0.7),
-        )
-        if "max_output_tokens" in kwargs:
-            config.max_output_tokens = kwargs["max_output_tokens"]
-
-        timeout_seconds = self.config.timeout_seconds
+        should_close_client = self._http_client is None
 
         try:
-            # Obtain async generator stream
-            stream = await asyncio.wait_for(
-                client.aio.models.generate_content_stream(
-                    model=model,
-                    contents=contents,
-                    config=config,
-                ),
-                timeout=timeout_seconds,
-            )
+            async with client.stream("POST", url, headers=headers, json=payload, timeout=timeout) as response:
+                if response.status_code != 200:
+                    body = await response.aread()
+                    err_msg = f"HTTP {response.status_code}: {body.decode('utf-8', errors='replace')}"
+                    raise httpx.HTTPStatusError(err_msg, request=response.request, response=response)
 
-            async for chunk in stream:
-                chunk_text = getattr(chunk, "text", None)
-                if chunk_text:
-                    yield chunk_text
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line or line.startswith(":"):
+                        # Skip empty lines or SSE ping/comments
+                        continue
+
+                    if line.startswith("data: "):
+                        data_str = line[len("data: "):].strip()
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            chunk_data = json.loads(data_str)
+                            choices = chunk_data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                text_chunk = delta.get("content")
+                                if text_chunk:
+                                    yield text_chunk
+                        except json.JSONDecodeError:
+                            # Skip unparseable chunk
+                            continue
 
         except Exception as exc:
             logger.error("cloud_ai_stream_failed", provider=self.name, model=model, error=str(exc))
             raise self._sanitize_error(exc, model=model, stage="stream") from exc
+        finally:
+            if should_close_client:
+                await client.aclose()

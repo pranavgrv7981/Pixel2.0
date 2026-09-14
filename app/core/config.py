@@ -33,18 +33,20 @@ class LoggingConfig(BaseModel):
 
 class CloudProviderConfig(BaseModel):
     enabled: bool = False
-    provider: str = "gemini"
-    api_key_env: str = "GEMINI_API_KEY"
+    provider: str = "openrouter"
+    base_url: str = "https://openrouter.ai/api/v1"
+    api_key_env: str = "OPENROUTER_API_KEY"
     api_key: str = ""
-    model: str = "gemini-2.5-flash"
+    model: str = "openrouter/free"
     default_model: str = ""
     timeout_seconds: float = 30.0
     max_retries: int = 2
-    base_url: str = ""
+    http_referer: str = ""
+    x_title: str = "Pixel"
 
     def get_model(self) -> str:
         """Return the effective model name."""
-        return self.model or self.default_model or "gemini-2.5-flash"
+        return self.model or self.default_model or "openrouter/free"
 
     def get_api_key(self) -> str:
         """Retrieve API key securely from explicit setting or environment variable."""
