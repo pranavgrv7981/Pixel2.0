@@ -1,0 +1,44 @@
+# Pixel v2 — Default Configuration
+
+[runtime]
+name = "Pixel"
+version = "2.0.0-alpha"
+debug = false
+
+[logging]
+level = "INFO"
+format = "console"  # "console" or "json"
+file = ""           # empty = stdout only
+
+[ai]
+default_provider = "fallback"
+request_timeout_seconds = 30
+max_retries = 2
+
+[ai.providers.cloud]
+enabled = false
+api_key = ""
+base_url = ""
+default_model = ""
+
+[ai.providers.ollama]
+enabled = false
+base_url = "http://localhost:11434"
+default_model = "llama3.2"
+
+[ai.providers.fallback]
+enabled = true
+
+[router]
+direct_confidence_threshold = 0.7
+fast_max_tokens = 256
+standard_max_tokens = 2048
+heavy_max_tokens = 8192
+
+[security]
+auto_allow_risk_levels = ["READ", "LOW"]
+prompt_risk_levels = ["MEDIUM"]
+deny_risk_levels = ["HIGH", "CRITICAL"]
+
+[intent]
+greeting_response = "Hello! I'm Pixel, your personal assistant. How can I help?"
