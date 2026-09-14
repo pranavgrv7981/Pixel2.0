@@ -18,9 +18,11 @@ max_retries = 2
 
 [ai.providers.cloud]
 enabled = false
-api_key = ""
-base_url = ""
-default_model = ""
+provider = "gemini"
+api_key_env = "GEMINI_API_KEY"
+model = "gemini-2.5-flash"
+timeout_seconds = 30
+max_retries = 2
 
 [ai.providers.ollama]
 enabled = false

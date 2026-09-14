@@ -11,6 +11,7 @@ dependencies = [
     "pydantic>=2.0",
     "structlog>=23.0",
     "tomli>=2.0;python_version<'3.11'",
+    "google-genai>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -26,10 +27,12 @@ include = ["app*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "-m 'not smoke'"
 markers = [
     "unit: pure unit tests (no I/O)",
     "integration: integration tests",
     "provider: tests requiring AI providers",
+    "smoke: optional live cloud API smoke tests",
 ]
 
 [tool.coverage.run]

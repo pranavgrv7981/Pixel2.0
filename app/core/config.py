@@ -33,9 +33,26 @@ class LoggingConfig(BaseModel):
 
 class CloudProviderConfig(BaseModel):
     enabled: bool = False
+    provider: str = "gemini"
+    api_key_env: str = "GEMINI_API_KEY"
     api_key: str = ""
-    base_url: str = ""
+    model: str = "gemini-2.5-flash"
     default_model: str = ""
+    timeout_seconds: float = 30.0
+    max_retries: int = 2
+    base_url: str = ""
+
+    def get_model(self) -> str:
+        """Return the effective model name."""
+        return self.model or self.default_model or "gemini-2.5-flash"
+
+    def get_api_key(self) -> str:
+        """Retrieve API key securely from explicit setting or environment variable."""
+        if self.api_key and self.api_key.strip():
+            return self.api_key.strip()
+        if self.api_key_env:
+            return os.getenv(self.api_key_env, "").strip()
+        return ""
 
 
 class OllamaProviderConfig(BaseModel):
