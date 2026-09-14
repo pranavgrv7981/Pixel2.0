@@ -250,9 +250,13 @@ class PixelRuntime:
                 )
             )
 
-            # --- Case 1: Direct intent with pre-computed response ---
-            if result.direct and result.response is not None:
+            # --- Case 1: Direct intent execution through ActionEngine ---
+            if result.direct:
                 self.state_machine.transition(PixelStateEnum.EXECUTING)
+                if result.intent:
+                    response = await self._execute_intent_action(result.intent, result.parameters)
+                else:
+                    response = result.response or "Direct command processed."
                 self.state_machine.transition(PixelStateEnum.SUCCESS)
                 self.state_machine.transition(PixelStateEnum.IDLE)
 
@@ -261,20 +265,9 @@ class PixelRuntime:
                     "request_completed",
                     request_id=request_id,
                     route="DIRECT",
+                    intent=result.intent or "DIRECT",
                     duration_ms=round(elapsed, 2),
                 )
-                return result.response
-
-            # --- Case 2: Direct intent requiring action execution ---
-            if result.direct and result.intent:
-                self.state_machine.transition(PixelStateEnum.EXECUTING)
-                response = await self._execute_intent_action(result.intent, result.parameters)
-                if response:
-                    self.state_machine.transition(PixelStateEnum.SUCCESS)
-                else:
-                    response = f"I recognized the command '{result.intent}' but the action handler is not yet implemented."
-                    self.state_machine.transition(PixelStateEnum.SUCCESS)
-                self.state_machine.transition(PixelStateEnum.IDLE)
                 return response
 
             # --- Case 3: AI routing with automatic fallback ---
@@ -370,21 +363,35 @@ class PixelRuntime:
 
     async def _execute_intent_action(
         self, intent: str, parameters: dict[str, Any]
-    ) -> str | None:
-        """Execute an action for a recognized intent."""
+    ) -> str:
+        """Execute an action for a recognized intent via ActionEngine."""
         if not self.action_engine or not self.action_registry:
-            return None
+            return f"I recognized the command '{intent}' but the action subsystem is unavailable."
 
-        action_name = intent.lower()
+        intent_to_action = {
+            "TIME": "time",
+            "DATE": "date",
+            "CALCULATOR": "calculate",
+            "SYSTEM_INFO": "system_info",
+            "OPEN_APPLICATION": "open_app",
+            "OPEN_WEBSITE": "open_website",
+            "LOCK_PC": "lock_pc",
+            "GREETING": "greeting",
+            "ECHO": "echo",
+        }
+
+        action_name = intent_to_action.get(intent.upper(), intent.lower())
         if not self.action_registry.has(action_name):
-            return None
+            return f"I recognized the command '{intent}' but the action handler is not yet implemented."
 
         request = ActionRequest(action=action_name, arguments=parameters)
         result = await self.action_engine.execute(request)
 
         if result.success:
             return result.output
-        return None
+        if result.error:
+            return result.error
+        return "Action could not be completed."
 
     def _format_error(self, exc: Exception) -> str:
         """Format an error for user display (no raw technical details)."""

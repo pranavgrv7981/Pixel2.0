@@ -84,7 +84,13 @@ class ActionEngine:
                 return ActionResult(success=False, error="Permission denied")
 
             if policy.decision == PermissionDecision.PROMPT:
-                logger.warning("action_requires_prompt", action=request.action)
+                if not request.arguments.get("confirmed", False):
+                    logger.warning("action_requires_prompt", action=request.action, reason=policy.reason)
+                    await self._emit_event(ActionFailed(action=request.action, error=f"Action '{request.action}' requires user confirmation."))
+                    return ActionResult(
+                        success=False,
+                        error=f"Action '{request.action}' requires user confirmation.",
+                    )
 
             # 3. Execution
             await self._emit_event(ActionStarted(action=request.action))
